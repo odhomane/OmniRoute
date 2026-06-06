@@ -114,6 +114,7 @@ jobs:
   merge-omniroute:
     name: Publish OmniRoute CLI manifest
     needs: build-omniroute
+    if: always() && needs.build-omniroute.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       packages: write
