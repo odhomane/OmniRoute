@@ -1,0 +1,204 @@
+name: Build and Publish CLI Images
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
+      - 'docs/**'
+      - '**.md'
+      - 'CHANGELOG.md'
+      - 'news.json'
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday 6 AM UTC
+  workflow_dispatch:
+
+env:
+  OMNIROUTE_IMAGE: ghcr.io/odhomane/omniroute
+  CLIPROXYAPI_IMAGE: ghcr.io/odhomane/cliproxyapi
+
+jobs:
+  # ── Sync from upstream (schedule only) ──────────────────────────────────
+  sync-upstream:
+    name: Sync upstream → fork
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream main
+        run: |
+          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git
+          git fetch upstream main --tags
+          BEFORE=$(git rev-parse HEAD)
+          git merge upstream/main --no-edit || {
+            echo "::warning::Merge conflict with upstream — skipping sync this week."
+            exit 0
+          }
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push origin main
+            echo "Synced upstream changes and pushed."
+          else
+            echo "Already up to date with upstream."
+          fi
+
+  # ── Build OmniRoute runner-cli (native arm64 + amd64) ───────────────────
+  build-omniroute:
+    name: Build OmniRoute CLI (${{ matrix.arch }})
+    needs: sync-upstream
+    if: always() && (needs.sync-upstream.result == 'success' || needs.sync-upstream.result == 'skipped')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build runner-cli and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner-cli
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.OMNIROUTE_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=omniroute-cli-${{ matrix.arch }}
+          cache-to: type=gha,scope=omniroute-cli-${{ matrix.arch }},mode=max
+
+      - name: Save digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: omniroute-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-omniroute:
+    name: Publish OmniRoute CLI manifest
+    needs: build-omniroute
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: omniroute-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Create and push multi-arch manifest
+        run: |
+          refs=()
+          for f in /tmp/digests/*; do
+            refs+=("${{ env.OMNIROUTE_IMAGE }}@sha256:$(basename "$f")")
+          done
+          docker buildx imagetools create \
+            -t "${{ env.OMNIROUTE_IMAGE }}:cli" \
+            "${refs[@]}"
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.OMNIROUTE_IMAGE }}:cli
+
+  # ── Build CLIProxyAPI (QEMU multi-arch, Go builds fast) ─────────────────
+  build-cliproxyapi:
+    name: Build CLIProxyAPI
+    needs: sync-upstream
+    if: always() && (needs.sync-upstream.result == 'success' || needs.sync-upstream.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout CLIProxyAPI
+        uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          fetch-depth: 0
+
+      - name: Get version
+        id: ver
+        run: |
+          VER=$(git describe --tags --always 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD)
+          echo "version=${VER#v}" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.CLIPROXYAPI_IMAGE }}:latest
+            ${{ env.CLIPROXYAPI_IMAGE }}:${{ steps.ver.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            COMMIT=${{ steps.ver.outputs.commit }}
+            BUILD_DATE=${{ github.run_id }}
+          cache-from: type=gha,scope=cliproxyapi
+          cache-to: type=gha,scope=cliproxyapi,mode=max
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.CLIPROXYAPI_IMAGE }}:latest
